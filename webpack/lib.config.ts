@@ -18,9 +18,11 @@ export default {
     lib: path.resolve(__dirname, '../src/lib.ts'),
   },
   output: {
+    library: 'UMAP',
     filename: 'umap-js.js',
     libraryTarget: 'umd',
     path: path.resolve(__dirname, '../lib'),
+    globalObject: 'this'
   },
   optimization: { minimize: false },
 };
