@@ -115,6 +115,16 @@ function makeTree(
   return tree;
 }
 
+interface SplitWork {
+  parentNode: RandomProjectionTreeNode | null;
+  isLeftChild: boolean;
+  data: Vectors;
+  indices: number[];
+  leafSize: number;
+  q: number;
+  random: RandomFn;
+}
+
 function makeEuclideanTree(
   data: Vectors,
   indices: number[],
@@ -122,31 +132,78 @@ function makeEuclideanTree(
   q: number,
   random: RandomFn
 ): RandomProjectionTreeNode {
-  if (indices.length > leafSize) {
-    const splitResults = euclideanRandomProjectionSplit(data, indices, random);
-    const { indicesLeft, indicesRight, hyperplane, offset } = splitResults;
+  const root: RandomProjectionTreeNode = { isLeaf: false };
+  const stack: SplitWork[] = [];
 
-    const leftChild = makeEuclideanTree(
-      data,
-      indicesLeft,
-      leafSize,
-      q + 1,
-      random
-    );
-    const rightChild = makeEuclideanTree(
-      data,
-      indicesRight,
-      leafSize,
-      q + 1,
-      random
-    );
+  stack.push({
+    parentNode: null,
+    isLeftChild: true,
+    data,
+    indices,
+    leafSize,
+    q,
+    random,
+  });
 
-    const node = { leftChild, rightChild, isLeaf: false, hyperplane, offset };
-    return node;
-  } else {
-    const node = { indices, isLeaf: true };
-    return node;
+  while (stack.length > 0) {
+    const work = stack.pop()!;
+    const {
+      parentNode,
+      isLeftChild,
+      data,
+      indices,
+      leafSize,
+      q,
+      random,
+    } = work;
+
+    const currentNode =
+      parentNode === null
+        ? root
+        : isLeftChild
+        ? parentNode.leftChild!
+        : parentNode.rightChild!;
+
+    if (indices.length <= leafSize) {
+      currentNode.isLeaf = true;
+      currentNode.indices = indices;
+    } else {
+      const splitResults = euclideanRandomProjectionSplit(
+        data,
+        indices,
+        random
+      );
+      const { indicesLeft, indicesRight, hyperplane, offset } = splitResults;
+
+      currentNode.isLeaf = false;
+      currentNode.hyperplane = hyperplane;
+      currentNode.offset = offset;
+      currentNode.leftChild = { isLeaf: false };
+      currentNode.rightChild = { isLeaf: false };
+
+      stack.push({
+        parentNode: currentNode,
+        isLeftChild: false,
+        data,
+        indices: indicesRight,
+        leafSize,
+        q: q + 1,
+        random,
+      });
+
+      stack.push({
+        parentNode: currentNode,
+        isLeftChild: true,
+        data,
+        indices: indicesLeft,
+        leafSize,
+        q: q + 1,
+        random,
+      });
+    }
   }
+
+  return root;
 }
 
 /**
@@ -236,10 +293,8 @@ function euclideanRandomProjectionSplit(
 }
 
 function flattenTree(tree: RandomProjectionTreeNode, leafSize: number) {
-  const nNodes = numNodes(tree);
-  const nLeaves = numLeaves(tree);
+  const { nNodes, nLeaves } = countNodes(tree);
 
-  // TODO: Verify that sparse code is not relevant...
   const hyperplanes = utils
     .range(nNodes)
     .map(() => utils.zeros(tree.hyperplane ? tree.hyperplane.length : 0));
@@ -249,8 +304,121 @@ function flattenTree(tree: RandomProjectionTreeNode, leafSize: number) {
   const indices = utils
     .range(nLeaves)
     .map(() => utils.range(leafSize).map(() => -1));
-  recursiveFlatten(tree, hyperplanes, offsets, children, indices, 0, 0);
+  // recursiveFlatten(tree, hyperplanes, offsets, children, indices, 0, 0);
+  nonRecursiveFlatten(tree, hyperplanes, offsets, children, indices, 0, 0);
   return new FlatTree(hyperplanes, offsets, children, indices);
+}
+
+interface StackFrame {
+  node: RandomProjectionTreeNode;
+  oldNodeNum: number;
+  nodeNum: number;
+  leafNum: number;
+  state: number;
+  parent: StackFrame | null;
+}
+
+function nonRecursiveFlatten(
+  tree: RandomProjectionTreeNode,
+  hyperplanes: number[][],
+  offsets: number[],
+  children: number[][],
+  indices: number[][],
+  initNodeNum: number,
+  initLeafNum: number
+): { nodeNum: number; leafNum: number } {
+  const stack: StackFrame[] = [
+    {
+      node: tree,
+      nodeNum: initNodeNum,
+      leafNum: initLeafNum,
+      oldNodeNum: initNodeNum,
+      state: 0,
+      parent: null,
+    },
+  ];
+
+  console.log('call', {
+    tree: tree,
+    nodeNum: initNodeNum,
+    leafNum: initLeafNum,
+  });
+  function getCurrentEntry() {
+    return stack[stack.length - 1];
+  }
+
+  function makeCall(
+    node: RandomProjectionTreeNode,
+    nodeNum: number,
+    leafNum: number
+  ) {
+    console.log('call', { tree: node, nodeNum, leafNum });
+    const entry = getCurrentEntry();
+    stack.push({
+      node,
+      nodeNum,
+      oldNodeNum: nodeNum,
+      leafNum,
+      parent: entry,
+      state: 0,
+    });
+  }
+
+  function returnCall(leafNum: number, nodeNum: number) {
+    console.log('return', { nodeNum, leafNum });
+    const { parent } = getCurrentEntry();
+    if (!parent) {
+      throw new Error('returning from call without parent');
+    }
+    parent.leafNum = leafNum;
+    parent.nodeNum = nodeNum;
+    parent.state += 1;
+    stack.pop();
+  }
+
+  while (true) {
+    const {
+      node,
+      nodeNum,
+      oldNodeNum,
+      leafNum,
+      state,
+      parent,
+    } = getCurrentEntry();
+    switch (state) {
+      case 0: {
+        if (node.isLeaf) {
+          children[nodeNum][0] = -leafNum;
+
+          // TODO: Triple check this operation corresponds to
+          // indices[leafNum : tree.indices.shape[0]] = tree.indices
+
+          indices[leafNum].splice(0, node.indices!.length, ...node.indices!);
+          returnCall(leafNum + 1, nodeNum);
+          continue;
+        }
+
+        hyperplanes[nodeNum] = node.hyperplane!;
+        offsets[nodeNum] = node.offset!;
+        children[nodeNum][0] = nodeNum + 1;
+        makeCall(node.leftChild!, nodeNum + 1, leafNum);
+        continue;
+      }
+      case 1: {
+        children[oldNodeNum][1] = nodeNum + 1;
+        makeCall(node.rightChild!, nodeNum + 1, leafNum);
+        continue;
+      }
+      case 2: {
+        if (parent) {
+          returnCall(leafNum, nodeNum);
+          continue;
+        } else {
+          return { nodeNum, leafNum };
+        }
+      }
+    }
+  }
 }
 
 function recursiveFlatten(
@@ -262,6 +430,7 @@ function recursiveFlatten(
   nodeNum: number,
   leafNum: number
 ): { nodeNum: number; leafNum: number } {
+  console.log('call', { tree, nodeNum, leafNum });
   if (tree.isLeaf) {
     children[nodeNum][0] = -leafNum;
 
@@ -269,6 +438,7 @@ function recursiveFlatten(
     // indices[leafNum : tree.indices.shape[0]] = tree.indices
     indices[leafNum].splice(0, tree.indices!.length, ...tree.indices!);
     leafNum += 1;
+    console.log('return', { nodeNum, leafNum });
     return { nodeNum, leafNum };
   } else {
     hyperplanes[nodeNum] = tree.hyperplane!;
@@ -299,7 +469,28 @@ function recursiveFlatten(
       nodeNum + 1,
       leafNum
     );
+    console.log('return', { nodeNum: res.nodeNum, leafNum: res.leafNum });
     return { nodeNum: res.nodeNum, leafNum: res.leafNum };
+  }
+}
+
+function countNodes(
+  tree: RandomProjectionTreeNode
+): { nNodes: number; nLeaves: number } {
+  let nNodes = 0;
+  let nLeaves = 0;
+  const stack = [tree];
+  while (true) {
+    const node = stack.pop();
+    if (node === undefined) {
+      return { nNodes, nLeaves };
+    }
+    nNodes++;
+    if (node.isLeaf) {
+      nLeaves++;
+    } else {
+      stack.push(node.leftChild!, node.rightChild!);
+    }
   }
 }
 
